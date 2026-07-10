@@ -297,6 +297,21 @@ def handle_message(phone, text, interactive_id):
             show_categories(phone)
         return
 
+    # website pre-filled messages, e.g. "Hi SevaSaathi, I'd like to book
+    # Bathroom Deep Clean (₹299)." — detect the service name and jump
+    # straight to the address step (but never while the customer is
+    # mid-flow typing an address or date)
+    if text and state not in ("awaiting_address", "awaiting_custom_date"):
+        for cat in CATALOG.values():
+            for sid, s in cat["services"].items():
+                if s["name"].lower() in text_lower:
+                    ask_address(phone, sid)
+                    return
+        # generic booking intent from the website without a specific service
+        if "sevasaathi" in text_lower or "book" in text_lower:
+            show_categories(phone)
+            return
+
     # button/list replies
     if interactive_id:
         if interactive_id == "show_menu":
