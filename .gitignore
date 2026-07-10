@@ -1,0 +1,6 @@
+# secrets & local-only files — never commit these
+.env
+*.ps1
+bot.db
+cloudflared.exe
+__pycache__/
