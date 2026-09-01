@@ -9,7 +9,7 @@ import os
 import json
 import sqlite3
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
 from flask import Flask, request
 
@@ -34,51 +34,51 @@ CATALOG = {
     "cat_cleaning": {
         "title": "Cleaning services",
         "services": {
-            "svc_mopping":   {"name": "Floor Sweeping & Mopping", "price": 199},
-            "svc_bathroom":  {"name": "Bathroom Deep Clean",      "price": 299},
-            "svc_kitchen":   {"name": "Kitchen Cleaning",         "price": 349},
-            "svc_deepclean": {"name": "Full House Deep Clean",    "price": 999},
-            "svc_sofa":      {"name": "Carpet & Sofa Cleaning",   "price": 499},
+            "svc_mopping":   {"name": "Floor Sweeping & Mopping", "price": 99},
+            "svc_bathroom":  {"name": "Bathroom Deep Clean",      "price": 99},
+            "svc_kitchen":   {"name": "Kitchen Cleaning",         "price": 99},
+            "svc_deepclean": {"name": "Full House Deep Clean",    "price": 499},
+            "svc_sofa":      {"name": "Carpet & Sofa Cleaning",   "price": 99},
         },
     },
     "cat_laundry": {
         "title": "Laundry & wardrobe",
         "services": {
-            "svc_laundry":   {"name": "Laundry & Ironing",      "price": 249},
-            "svc_wardrobe":  {"name": "Wardrobe Cleaning",      "price": 149},
+            "svc_laundry":   {"name": "Laundry & Ironing",      "price": 99},
+            "svc_wardrobe":  {"name": "Wardrobe Cleaning",      "price": 99},
         },
     },
     "cat_kitchen": {
         "title": "Kitchen & utensils",
         "services": {
-            "svc_utensils":  {"name": "Utensil Washing",        "price": 149},
-            "svc_kprep":     {"name": "Kitchen Prep",           "price": 149},
-            "svc_cabinet":   {"name": "Kitchen Cabinet Clean",  "price": 149},
+            "svc_utensils":  {"name": "Utensil Washing",        "price": 99},
+            "svc_kprep":     {"name": "Kitchen Prep",           "price": 99},
+            "svc_cabinet":   {"name": "Kitchen Cabinet Clean",  "price": 99},
         },
     },
     "cat_packing": {
         "title": "Packing & shifting",
         "services": {
-            "svc_packing":   {"name": "Packing / Unpacking",    "price": 299},
+            "svc_packing":   {"name": "Packing / Unpacking",    "price": 99},
         },
     },
     "cat_party": {
         "title": "Party ready",
         "services": {
-            "svc_preparty":  {"name": "Pre-Party Express Clean",  "price": 349},
-            "svc_afterparty":{"name": "After-Party Express Clean","price": 349},
+            "svc_preparty":  {"name": "Pre-Party Express Clean",  "price": 99},
+            "svc_afterparty":{"name": "After-Party Express Clean","price": 99},
         },
     },
     "cat_extras": {
         "title": "Extras",
         "services": {
-            "svc_window":    {"name": "Window Cleaning",        "price": 199},
+            "svc_window":    {"name": "Window Cleaning",        "price": 99},
             "svc_fan":       {"name": "Fan Cleaning",           "price": 79},
             "svc_dusting":   {"name": "Dusting & Wiping",       "price": 99},
             "svc_balcony":   {"name": "Balcony Cleaning",       "price": 99},
-            "svc_fridge":    {"name": "Fridge Cleaning",        "price": 149},
+            "svc_fridge":    {"name": "Fridge Cleaning",        "price": 99},
             "svc_plant":     {"name": "Plant Care",             "price": 99},
-            "svc_car":       {"name": "Car Surface Cleaning",   "price": 199},
+            "svc_car":       {"name": "Car Surface Cleaning",   "price": 99},
         },
     },
 }
@@ -107,6 +107,7 @@ def init_db():
             category TEXT, service TEXT,
             address TEXT, date TEXT, slot TEXT,
             payment TEXT,
+            worker_name TEXT, worker_area TEXT,
             updated_at TEXT
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS orders (
@@ -117,11 +118,28 @@ def init_db():
             status TEXT DEFAULT 'new',
             created_at TEXT
         )""")
-        # migrate: add payment column to tables created by older versions
+        # People applying to work with us — bot collects the lead, admin follows up.
+        c.execute("""CREATE TABLE IF NOT EXISTS worker_applications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT, name TEXT, area TEXT, skills TEXT,
+            status TEXT DEFAULT 'new',
+            created_at TEXT
+        )""")
+        # WhatsApp message ids we've already handled, so a retried webhook
+        # delivery doesn't trigger a second reply (see already_processed()).
+        c.execute("""CREATE TABLE IF NOT EXISTS processed_messages (
+            id TEXT PRIMARY KEY,
+            created_at TEXT
+        )""")
+        # migrate older bot.db files that predate some columns
         for table in ("sessions", "orders"):
             cols = [r["name"] for r in c.execute(f"PRAGMA table_info({table})")]
             if "payment" not in cols:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN payment TEXT")
+        scols = [r["name"] for r in c.execute("PRAGMA table_info(sessions)")]
+        for col in ("worker_name", "worker_area"):
+            if col not in scols:
+                c.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT")
 
 def get_session(phone):
     with db() as c:
@@ -140,7 +158,30 @@ def update_session(phone, **kwargs):
 
 def reset_session(phone):
     update_session(phone, state="start", category=None, service=None,
-                   address=None, date=None, slot=None, payment=None)
+                   address=None, date=None, slot=None, payment=None,
+                   worker_name=None, worker_area=None)
+
+def already_processed(message_id):
+    """WhatsApp re-delivers a webhook if we don't ACK with 200 fast enough, so the
+    same message can arrive 2-3 times — that is what made the bot reply twice or
+    thrice. We record each message id; the first delivery inserts it and is handled,
+    any retry hits the PRIMARY KEY and is skipped."""
+    if not message_id:
+        return False
+    try:
+        with db() as c:
+            c.execute("INSERT INTO processed_messages (id, created_at) VALUES (?, ?)",
+                      (message_id, datetime.now().isoformat()))
+            # keep the table small — retries only happen within a few hours
+            cutoff = (datetime.now() - timedelta(days=1)).isoformat()
+            c.execute("DELETE FROM processed_messages WHERE created_at < ?", (cutoff,))
+        return False    # inserted just now -> first time we've seen this message
+    except sqlite3.IntegrityError:
+        return True     # already recorded -> retried/duplicate delivery
+    except Exception as e:
+        # Fail open: a rare duplicate is better than silently dropping a message.
+        print("DEDUP ERROR:", e)
+        return False
 
 # ---------------- WHATSAPP SEND HELPERS ----------------
 def send(payload):
@@ -188,7 +229,8 @@ def show_welcome(phone):
         f"Namaste! 🙏 {BUSINESS_NAME} mein aapka swagat hai.\n\n"
         "Hum ghar ki cleaning services provide karte hain — verified professionals, "
         "fixed pricing, aapke time pe.",
-        [{"id": "show_menu", "title": "Services dekhein"}])
+        [{"id": "show_menu", "title": "Services dekhein"},
+         {"id": "join_worker", "title": "Kaam karna hai"}])
     update_session(phone, state="welcome_sent")
 
 def show_categories(phone):
@@ -280,6 +322,50 @@ def find_service(svc_id):
             return cat["services"][svc_id]
     return {"name": "Unknown", "price": 0}
 
+# ---------------- WORKER SIGN-UP (people who want to work WITH us) ----------------
+WORKER_KEYWORDS = (
+    "worker", "wanna be a worker", "want to be a worker", "become a worker",
+    "want to work", "work with you", "work for you", "join as", "apply for work",
+    "job", "naukri", "rozgar", "kaam karna", "kaam chahiye", "kaam karunga",
+    "kaam karungi", "partner banna", "become a partner",
+)
+
+def is_worker_intent(text_lower):
+    """True when the message is about wanting a JOB with us, not booking a service."""
+    return any(k in text_lower for k in WORKER_KEYWORDS)
+
+def start_worker_signup(phone):
+    send_text(phone,
+        "Namaste! 🙏 SevaSaathi ke saath *kaam* karna chahte hain? Zabardast!\n\n"
+        "Hum verified safai professionals ko unke area ke customers se jodte hain — "
+        "aapke time pe kaam, seedha aapko payment.\n\n"
+        "Shuru karte hain — aapka *pura naam* kya hai?")
+    update_session(phone, state="worker_name")
+
+def finish_worker_signup(phone, skills_text):
+    session = get_session(phone)
+    name = session.get("worker_name") or ""
+    area = session.get("worker_area") or ""
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO worker_applications (phone, name, area, skills, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (phone, name, area, skills_text, datetime.now().isoformat()))
+        app_id = cur.lastrowid
+    send_text(phone,
+        f"✅ Aapki application mil gayi! (Ref #{app_id})\n\n"
+        f"Naam: {name}\nArea: {area}\nKaam: {skills_text}\n\n"
+        "Hamari team 1-2 din mein aapko call karegi verification ke liye. "
+        "Dhanyavaad! 🙏\n\n"
+        "Service book karni ho to 'menu' likhein.")
+    if ADMIN_NUMBER:
+        send_text(ADMIN_NUMBER,
+            f"🧑‍🔧 NEW WORKER APPLICATION #{app_id}\n"
+            f"Name: {name}\nPhone: {phone}\nArea: {area}\n"
+            f"Skills/Experience: {skills_text}\n\n"
+            "Call karke verify karein aur onboard karein.")
+    reset_session(phone)
+
 FALLBACK = ("Samajh nahi paya 🙏\n'menu' likhein services dekhne ke liye, "
             "ya apna sawal likhein — hum jaldi reply karenge.")
 
@@ -297,11 +383,24 @@ def handle_message(phone, text, interactive_id):
             show_categories(phone)
         return
 
+    # "I want to work / be a worker" -> job sign-up, NOT a booking. Checked
+    # before the website booking detection below, so "hi sevasaathi, i wanna be
+    # a worker" (and the website's "Join as Worker" button) isn't mistaken for a
+    # booking. Never interrupt someone mid-flow typing an address/date or the
+    # worker form.
+    if (text and is_worker_intent(text_lower)
+            and state not in ("awaiting_address", "awaiting_custom_date",
+                              "worker_name", "worker_area", "worker_work")):
+        start_worker_signup(phone)
+        return
+
     # website pre-filled messages, e.g. "Hi SevaSaathi, I'd like to book
-    # Bathroom Deep Clean (₹299)." — detect the service name and jump
-    # straight to the address step (but never while the customer is
-    # mid-flow typing an address or date)
-    if text and state not in ("awaiting_address", "awaiting_custom_date"):
+    # Bathroom Deep Clean (₹99)." — detect the service name and jump straight to
+    # the address step (but never while the customer is mid-flow typing an
+    # address/date, or filling the worker form — those answers can contain
+    # service words like "bathroom")
+    if text and state not in ("awaiting_address", "awaiting_custom_date",
+                              "worker_name", "worker_area", "worker_work"):
         for cat in CATALOG.values():
             for sid, s in cat["services"].items():
                 if s["name"].lower() in text_lower:
@@ -316,6 +415,8 @@ def handle_message(phone, text, interactive_id):
     if interactive_id:
         if interactive_id == "show_menu":
             show_categories(phone); return
+        if interactive_id == "join_worker":
+            start_worker_signup(phone); return
         if interactive_id in CATALOG:
             show_services(phone, interactive_id); return
         if find_service(interactive_id)["price"] > 0 or interactive_id.startswith("svc_"):
@@ -342,6 +443,22 @@ def handle_message(phone, text, interactive_id):
     if state == "awaiting_custom_date" and text:
         update_session(phone, date=text.strip(), state="awaiting_slot")
         ask_slot(phone); return
+    # worker sign-up form (name -> area -> skills)
+    if state == "worker_name" and text:
+        update_session(phone, worker_name=text.strip(), state="worker_area")
+        send_text(phone,
+            f"Shukriya {text.strip()}! 📍 Aap *kaunse area / mohalle* mein kaam "
+            "kar sakte hain? (jaise: Model Town, Dhand, Kaithal city)")
+        return
+    if state == "worker_area" and text:
+        update_session(phone, worker_area=text.strip(), state="worker_work")
+        send_text(phone,
+            "Aap *kaunsa kaam* kar sakte hain aur kitna *experience* hai?\n"
+            "(jaise: floor & bathroom cleaning, 2 saal ka experience)")
+        return
+    if state == "worker_work" and text:
+        finish_worker_signup(phone, text.strip())
+        return
     if state == "start":
         show_welcome(phone); return
 
@@ -363,6 +480,9 @@ def webhook():
             for change in entry.get("changes", []):
                 value = change.get("value", {})
                 for msg in value.get("messages", []):
+                    # Skip duplicate/retried webhook deliveries of the same message.
+                    if already_processed(msg.get("id")):
+                        continue
                     phone = msg["from"]
                     text, interactive_id = None, None
                     if msg["type"] == "text":
