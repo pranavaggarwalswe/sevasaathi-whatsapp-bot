@@ -7,11 +7,12 @@ Flow: Welcome -> Category menu -> Service menu -> Address -> Date -> Slot -> Con
 
 import os
 import json
-import sqlite3
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import quote
 from flask import Flask, request
+from pymongo import MongoClient, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 app = Flask(__name__)
 
@@ -19,7 +20,9 @@ app = Flask(__name__)
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "my_secret_verify_token_123")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")          # Meta permanent access token
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID", "")        # from Meta dashboard
-ADMIN_NUMBER = os.environ.get("ADMIN_NUMBER", "")              # your personal WhatsApp e.g. 9198XXXXXXXX
+ADMIN_NUMBER = os.environ.get("ADMIN_NUMBER", "")              # one or MORE numbers, comma-separated e.g. 9198...,9199...
+# Split into a clean list so a new order/worker can alert several people at once.
+ADMIN_NUMBERS = [n.strip() for n in ADMIN_NUMBER.split(",") if n.strip()]
 BUSINESS_NAME = os.environ.get("BUSINESS_NAME", "SevaSaathi")
 UPI_ID = os.environ.get("UPI_ID", "yourname@upi")
 
@@ -89,72 +92,67 @@ SLOTS = {
     "slot_evening":   "Shaam (3 PM - 6 PM)",
 }
 
-# ---------------- DATABASE (session state + orders) ----------------
-# Absolute path so the DB lands next to bot.py no matter where the bot
-# is launched from (a relative path would scatter bot.db files around).
-DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
+# ---------------- DATABASE (shared MongoDB with the web app) ----------------
+# The bot and the SevaSaathi web app use the SAME MongoDB, so WhatsApp orders
+# show up in the web admin dashboard. Set MONGODB_URI to the same Atlas string
+# the web app uses. Collections:
+#   bot_sessions   -> per-phone conversation state (bot only)
+#   whatsapporders -> confirmed orders (read by the web admin dashboard)
+#   counters       -> sequential order-number generator
+MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://127.0.0.1:27017")
+MONGODB_DB = os.environ.get("MONGODB_DB", "sevasaathi")
 
-def db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    return conn
+_client = MongoClient(MONGODB_URI)
+_db = _client[MONGODB_DB]
+sessions_col = _db["bot_sessions"]
+orders_col = _db["whatsapporders"]
+counters_col = _db["counters"]
+processed_col = _db["processed_messages"]   # WhatsApp message ids we've already handled (dedup)
+worker_apps_col = _db["worker_applications"] # people who want to work with us (admin follows up)
+
+# fields we persist on a session (mirrors the old SQLite columns)
+SESSION_FIELDS = ("state", "category", "service", "address", "date", "slot", "payment")
 
 def init_db():
-    with db() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS sessions (
-            phone TEXT PRIMARY KEY,
-            state TEXT DEFAULT 'start',
-            category TEXT, service TEXT,
-            address TEXT, date TEXT, slot TEXT,
-            payment TEXT,
-            worker_name TEXT, worker_area TEXT,
-            updated_at TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone TEXT, service TEXT, price INTEGER,
-            address TEXT, date TEXT, slot TEXT,
-            payment TEXT,
-            status TEXT DEFAULT 'new',
-            created_at TEXT
-        )""")
-        # People applying to work with us — bot collects the lead, admin follows up.
-        c.execute("""CREATE TABLE IF NOT EXISTS worker_applications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone TEXT, name TEXT, area TEXT, skills TEXT,
-            status TEXT DEFAULT 'new',
-            created_at TEXT
-        )""")
-        # WhatsApp message ids we've already handled, so a retried webhook
-        # delivery doesn't trigger a second reply (see already_processed()).
-        c.execute("""CREATE TABLE IF NOT EXISTS processed_messages (
-            id TEXT PRIMARY KEY,
-            created_at TEXT
-        )""")
-        # migrate older bot.db files that predate some columns
-        for table in ("sessions", "orders"):
-            cols = [r["name"] for r in c.execute(f"PRAGMA table_info({table})")]
-            if "payment" not in cols:
-                c.execute(f"ALTER TABLE {table} ADD COLUMN payment TEXT")
-        scols = [r["name"] for r in c.execute("PRAGMA table_info(sessions)")]
-        for col in ("worker_name", "worker_area"):
-            if col not in scols:
-                c.execute(f"ALTER TABLE sessions ADD COLUMN {col} TEXT")
+    # Indexes are idempotent; safe to call on every startup.
+    orders_col.create_index("orderNumber")
+    orders_col.create_index("status")
+    # Auto-expire dedup records 24h after insert, so the collection stays tiny.
+    # WhatsApp only retries for a few hours, so a 1-day memory is plenty.
+    processed_col.create_index("createdAt", expireAfterSeconds=86400)
+    worker_apps_col.create_index("applicationNumber")
+    worker_apps_col.create_index("status")
+
+def next_order_number():
+    doc = counters_col.find_one_and_update(
+        {"_id": "orderNumber"},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return doc["seq"]
+
+def next_worker_number():
+    doc = counters_col.find_one_and_update(
+        {"_id": "workerNumber"},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return doc["seq"]
 
 def get_session(phone):
-    with db() as c:
-        row = c.execute("SELECT * FROM sessions WHERE phone=?", (phone,)).fetchone()
-        if not row:
-            c.execute("INSERT INTO sessions (phone, state, updated_at) VALUES (?, 'start', ?)",
-                      (phone, datetime.now().isoformat()))
-            return {"phone": phone, "state": "start"}
-        return dict(row)
+    row = sessions_col.find_one({"_id": phone})
+    if not row:
+        sessions_col.insert_one(
+            {"_id": phone, "state": "start", "updated_at": datetime.now().isoformat()})
+        return {"phone": phone, "state": "start"}
+    row["phone"] = phone
+    return row
 
 def update_session(phone, **kwargs):
     kwargs["updated_at"] = datetime.now().isoformat()
-    sets = ", ".join(f"{k}=?" for k in kwargs)
-    with db() as c:
-        c.execute(f"UPDATE sessions SET {sets} WHERE phone=?", (*kwargs.values(), phone))
+    sessions_col.update_one({"_id": phone}, {"$set": kwargs}, upsert=True)
 
 def reset_session(phone):
     update_session(phone, state="start", category=None, service=None,
@@ -162,22 +160,17 @@ def reset_session(phone):
                    worker_name=None, worker_area=None)
 
 def already_processed(message_id):
-    """WhatsApp re-delivers a webhook if we don't ACK with 200 fast enough, so the
-    same message can arrive 2-3 times — that is what made the bot reply twice or
-    thrice. We record each message id; the first delivery inserts it and is handled,
-    any retry hits the PRIMARY KEY and is skipped."""
+    """WhatsApp re-delivers a webhook if we don't ACK with 200 fast enough, so
+    the same message can arrive 2-3 times — that is what made the bot reply
+    twice or thrice. We record each message id atomically: the first delivery
+    inserts it and is handled; any retry hits the duplicate key and is skipped."""
     if not message_id:
         return False
     try:
-        with db() as c:
-            c.execute("INSERT INTO processed_messages (id, created_at) VALUES (?, ?)",
-                      (message_id, datetime.now().isoformat()))
-            # keep the table small — retries only happen within a few hours
-            cutoff = (datetime.now() - timedelta(days=1)).isoformat()
-            c.execute("DELETE FROM processed_messages WHERE created_at < ?", (cutoff,))
-        return False    # inserted just now -> first time we've seen this message
-    except sqlite3.IntegrityError:
-        return True     # already recorded -> retried/duplicate delivery
+        processed_col.insert_one({"_id": message_id, "createdAt": datetime.utcnow()})
+        return False   # inserted just now -> first time we've seen this message
+    except DuplicateKeyError:
+        return True    # already recorded -> this is a retried/duplicate delivery
     except Exception as e:
         # Fail open: a rare duplicate is better than silently dropping a message.
         print("DEDUP ERROR:", e)
@@ -193,6 +186,12 @@ def send(payload):
 
 def send_text(to, text):
     send({"to": to, "type": "text", "text": {"body": text}})
+
+def notify_admins(text):
+    """Alert every configured admin number. ADMIN_NUMBER may hold several numbers
+    separated by commas, so an order/worker application can reach both partners."""
+    for num in ADMIN_NUMBERS:
+        send_text(num, text)
 
 def send_list(to, header, body, button_label, section_title, rows):
     """rows = [{"id": ..., "title": ..., "description": ...}] max 10"""
@@ -279,13 +278,20 @@ def confirm_order(phone, session):
     order_date = session["date"]
     slot_label = SLOTS.get(session["slot"], session["slot"])
     pay_label = "UPI"
-    with db() as c:
-        cur = c.execute(
-            "INSERT INTO orders (phone, service, price, address, date, slot, payment, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (phone, svc["name"], svc["price"], session["address"],
-             order_date, slot_label, pay_label, datetime.now().isoformat()))
-        order_id = cur.lastrowid
+    order_id = next_order_number()
+    orders_col.insert_one({
+        "orderNumber": order_id,
+        "phone": phone,
+        "service": svc["name"],
+        "price": svc["price"],
+        "address": session["address"],
+        "date": order_date,
+        "slot": slot_label,
+        "payment": "upi",
+        "status": "new",
+        "source": "whatsapp",
+        "createdAt": datetime.utcnow(),
+    })
 
     send_text(phone,
         f"✅ Booking confirm ho gayi! (Order #{order_id})\n\n"
@@ -305,15 +311,14 @@ def confirm_order(phone, session):
         f"Ya seedha is UPI ID par bhejein: {UPI_ID}\n"
         f"(Note mein 'Order #{order_id}' zaroor likhein)")
 
-    # dispatch notification to admin
-    if ADMIN_NUMBER:
-        send_text(ADMIN_NUMBER,
-            f"🔔 NEW ORDER #{order_id}\n"
-            f"Customer: {phone}\nService: {svc['name']} — ₹{svc['price']}\n"
-            f"Date/Time: {order_date} — {slot_label}\n"
-            f"Address: {session['address']}\n"
-            f"Payment: UPI — link bheja gaya, apne UPI app mein payment check karein"
-            "\n\nProfessional assign karke customer ko inform karein.")
+    # dispatch notification to admin(s)
+    notify_admins(
+        f"🔔 NEW ORDER #{order_id}\n"
+        f"Customer: {phone}\nService: {svc['name']} — ₹{svc['price']}\n"
+        f"Date/Time: {order_date} — {slot_label}\n"
+        f"Address: {session['address']}\n"
+        f"Payment: UPI — link bheja gaya, apne UPI app mein payment check karein"
+        "\n\nProfessional assign karke customer ko inform karein.")
     reset_session(phone)
 
 def find_service(svc_id):
@@ -339,31 +344,36 @@ def start_worker_signup(phone):
         "Namaste! 🙏 SevaSaathi ke saath *kaam* karna chahte hain? Zabardast!\n\n"
         "Hum verified safai professionals ko unke area ke customers se jodte hain — "
         "aapke time pe kaam, seedha aapko payment.\n\n"
-        "Shuru karte hain — aapka *pura naam* kya hai?")
+        "Shuru karte hain — aapka *pura naam* kya hai?\n\n"
+        "_(Kabhi bhi 'cancel' likh kar ruk sakte hain.)_")
     update_session(phone, state="worker_name")
 
 def finish_worker_signup(phone, skills_text):
     session = get_session(phone)
-    name = session.get("worker_name") or ""
-    area = session.get("worker_area") or ""
-    with db() as c:
-        cur = c.execute(
-            "INSERT INTO worker_applications (phone, name, area, skills, created_at) "
-            "VALUES (?,?,?,?,?)",
-            (phone, name, area, skills_text, datetime.now().isoformat()))
-        app_id = cur.lastrowid
+    name = session.get("worker_name", "")
+    area = session.get("worker_area", "")
+    app_id = next_worker_number()
+    worker_apps_col.insert_one({
+        "applicationNumber": app_id,
+        "phone": phone,
+        "name": name,
+        "area": area,
+        "skills": skills_text,
+        "status": "new",
+        "source": "whatsapp",
+        "createdAt": datetime.utcnow(),
+    })
     send_text(phone,
         f"✅ Aapki application mil gayi! (Ref #{app_id})\n\n"
         f"Naam: {name}\nArea: {area}\nKaam: {skills_text}\n\n"
         "Hamari team 1-2 din mein aapko call karegi verification ke liye. "
         "Dhanyavaad! 🙏\n\n"
         "Service book karni ho to 'menu' likhein.")
-    if ADMIN_NUMBER:
-        send_text(ADMIN_NUMBER,
-            f"🧑‍🔧 NEW WORKER APPLICATION #{app_id}\n"
-            f"Name: {name}\nPhone: {phone}\nArea: {area}\n"
-            f"Skills/Experience: {skills_text}\n\n"
-            "Call karke verify karein aur onboard karein.")
+    notify_admins(
+        f"🧑‍🔧 NEW WORKER APPLICATION #{app_id}\n"
+        f"Name: {name}\nPhone: {phone}\nArea: {area}\n"
+        f"Skills/Experience: {skills_text}\n\n"
+        "Call karke verify karein aur onboard karein.")
     reset_session(phone)
 
 FALLBACK = ("Samajh nahi paya 🙏\n'menu' likhein services dekhne ke liye, "
@@ -383,11 +393,19 @@ def handle_message(phone, text, interactive_id):
             show_categories(phone)
         return
 
+    # let the user bail out of ANY flow (worker sign-up, booking, etc.)
+    if text_lower in ("cancel", "stop", "exit", "cancel karo", "band karo",
+                      "rehne do", "chhodo", "chodo"):
+        reset_session(phone)
+        send_text(phone,
+            "Theek hai, cancel ho gaya 👍\n"
+            "Service book karni ho to 'menu' likhein.")
+        return
+
     # "I want to work / be a worker" -> job sign-up, NOT a booking. Checked
     # before the website booking detection below, so "hi sevasaathi, i wanna be
-    # a worker" (and the website's "Join as Worker" button) isn't mistaken for a
-    # booking. Never interrupt someone mid-flow typing an address/date or the
-    # worker form.
+    # a worker" isn't mistaken for a booking. Never interrupt someone who is
+    # mid-flow typing an address/date or already filling the worker form.
     if (text and is_worker_intent(text_lower)
             and state not in ("awaiting_address", "awaiting_custom_date",
                               "worker_name", "worker_area", "worker_work")):
@@ -395,10 +413,10 @@ def handle_message(phone, text, interactive_id):
         return
 
     # website pre-filled messages, e.g. "Hi SevaSaathi, I'd like to book
-    # Bathroom Deep Clean (₹99)." — detect the service name and jump straight to
-    # the address step (but never while the customer is mid-flow typing an
-    # address/date, or filling the worker form — those answers can contain
-    # service words like "bathroom")
+    # Bathroom Deep Clean (₹299)." — detect the service name and jump
+    # straight to the address step (but never while the customer is mid-flow
+    # typing an address/date, or filling the worker form — those answers can
+    # contain service words like "bathroom")
     if text and state not in ("awaiting_address", "awaiting_custom_date",
                               "worker_name", "worker_area", "worker_work"):
         for cat in CATALOG.values():
@@ -502,9 +520,13 @@ def webhook():
 def home():
     return f"{BUSINESS_NAME} bot is running ✅", 200
 
-# Create tables at import time too, so the bot works under gunicorn/production
-# servers that never execute the __main__ block.
-init_db()
+# Create indexes at import time too, so the bot works under gunicorn/production
+# servers that never execute the __main__ block. Wrapped so a wrong/missing
+# MONGODB_URI logs a clear error instead of crash-looping the whole service.
+try:
+    init_db()
+except Exception as e:
+    print("INIT_DB ERROR — check the MONGODB_URI env var on Render:", e)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
