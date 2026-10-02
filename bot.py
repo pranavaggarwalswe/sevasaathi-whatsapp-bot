@@ -91,7 +91,6 @@ CATALOG = {
             "svc_dusting":   {"name": "Dusting & Wiping",       "price": 199, "mrp": 299},
             "svc_balcony":   {"name": "Balcony Cleaning",       "price": 199, "mrp": 299},
             "svc_fridge":    {"name": "Fridge Cleaning",        "price": 199, "mrp": 299},
-            "svc_plant":     {"name": "Plant Care",             "price": 199, "mrp": 299},
             "svc_car":       {"name": "Car Surface Cleaning",   "price": 199, "mrp": 299},
         },
     },
@@ -127,10 +126,15 @@ def price_text(svc):
         return f"~₹{svc['mrp']}~ *₹{svc['price']}*"
     return f"*₹{svc['price']}*"
 
+def strike(text):
+    """WhatsApp list rows ignore ~strike~ formatting, so draw the line with
+    Unicode instead (a combining long stroke after every character)."""
+    return "".join(ch + "̶" for ch in text)
+
 def list_price(svc):
-    """WhatsApp list rows don't render ~strike~ formatting, so say it in plain words."""
+    """For WhatsApp list rows: struck original + offer price, e.g. ₹̶2̶9̶9̶ ₹199"""
     if svc.get("mrp"):
-        return f"₹{svc['price']} (pehle ₹{svc['mrp']})"
+        return f"{strike('₹' + str(svc['mrp']))} ₹{svc['price']}"
     return f"₹{svc['price']}"
 
 # ---------------- DATABASE (shared MongoDB with the web app) ----------------
@@ -301,10 +305,17 @@ def ask_address(phone, svc_id):
     if svc_id in DIWALI_SERVICES and not diwali_active():
         diwali_ended(phone); return
     svc = find_service(svc_id)
+    if not svc["price"]:   # an old button for a service we dropped (e.g. Plant Care)
+        service_gone(phone); return
     send_text(phone,
         f"✅ {svc['name']} — {price_text(svc)}\n\n"
         "📍 Apna address bhejein (ghar number / mohalla + landmark):")
     update_session(phone, state="awaiting_address", service=svc_id)
+
+def service_gone(phone):
+    send_text(phone,
+        "🙏 Ye service ab available nahi hai. Hamari baaki services neeche dekhein 👇")
+    show_categories(phone)
 
 # ---------------- DIWALI FLOW (Oct 2026) — remove after the offer ----------------
 def show_diwali_options(phone):
@@ -378,6 +389,9 @@ def confirm_order(phone, session):
         reset_session(phone)
         diwali_ended(phone); return
     svc = find_service(session["service"])
+    if not svc["price"]:   # we dropped this service while they were mid-booking
+        reset_session(phone)
+        service_gone(phone); return
     order_date = session["date"]
     slot_label = SLOTS.get(session["slot"], session["slot"])
     pay_label = "UPI"
