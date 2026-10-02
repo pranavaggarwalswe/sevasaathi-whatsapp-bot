@@ -8,7 +8,7 @@ Flow: Welcome -> Category menu -> Service menu -> Address -> Date -> Slot -> Con
 import os
 import json
 import requests
-from datetime import datetime
+from datetime import datetime, date, timedelta, timezone
 from urllib.parse import quote
 from flask import Flask, request
 from pymongo import MongoClient, ReturnDocument
@@ -30,58 +30,69 @@ API_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 HEADERS = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
 
 # ---------------- SERVICE CATALOG (edit prices here) ----------------
-# NOTE: the first 8 services mirror the website (project pronoto/index.html).
-# If you change a price here, change it on the website too (service cards +
-# the JSON-LD block in <head>), and vice versa.
+# "price" = what the customer pays. Optional "mrp" = the original price, shown
+# struck through (same discount scheme as the website). Optional "short" = a
+# shorter label for WhatsApp list rows (max 24 chars).
+# The first 8 regular services mirror the website (seva saathi official/website/
+# index.html) — if you change one, change the website too, and vice versa.
 CATALOG = {
+    # DIWALI (Oct 2026) — only shown while diwali_active(); remove after the offer
+    "cat_diwali": {
+        "title": "🪔 Diwali Special",
+        "desc": "1 house help ₹499 · 2 house help ₹799",
+        "services": {
+            "svc_diwali_1": {"name": "Diwali Cleaning (1 House Help)", "short": "1 House Help", "price": 499},
+            "svc_diwali_2": {"name": "Diwali Cleaning (2 House Help)", "short": "2 House Help", "price": 799},
+        },
+    },
     "cat_cleaning": {
         "title": "Cleaning services",
         "services": {
-            "svc_mopping":   {"name": "Floor Sweeping & Mopping", "price": 99},
-            "svc_bathroom":  {"name": "Bathroom Deep Clean",      "price": 99},
-            "svc_kitchen":   {"name": "Kitchen Cleaning",         "price": 99},
-            "svc_deepclean": {"name": "Full House Deep Clean",    "price": 499},
-            "svc_sofa":      {"name": "Carpet & Sofa Cleaning",   "price": 99},
+            "svc_mopping":   {"name": "Floor Sweeping & Mopping", "price": 199},
+            "svc_bathroom":  {"name": "Bathroom Deep Clean",      "price": 199, "mrp": 299},
+            "svc_kitchen":   {"name": "Kitchen Cleaning",         "price": 199, "mrp": 349},
+            "svc_deepclean": {"name": "Full House Deep Clean",    "price": 499, "mrp": 999},
+            "svc_sofa":      {"name": "Carpet & Sofa Cleaning",   "price": 199, "mrp": 499},
         },
     },
     "cat_laundry": {
         "title": "Laundry & wardrobe",
         "services": {
-            "svc_laundry":   {"name": "Laundry & Ironing",      "price": 99},
-            "svc_wardrobe":  {"name": "Wardrobe Cleaning",      "price": 99},
+            "svc_laundry":   {"name": "Laundry & Ironing",      "price": 199, "mrp": 249},
+            "svc_wardrobe":  {"name": "Wardrobe Cleaning",      "price": 199, "mrp": 299},
         },
     },
     "cat_kitchen": {
         "title": "Kitchen & utensils",
         "services": {
-            "svc_utensils":  {"name": "Utensil Washing",        "price": 99},
-            "svc_kprep":     {"name": "Kitchen Prep",           "price": 99},
-            "svc_cabinet":   {"name": "Kitchen Cabinet Clean",  "price": 99},
+            "svc_utensils":  {"name": "Utensil Washing",        "price": 199, "mrp": 249},
+            "svc_kprep":     {"name": "Kitchen Prep",           "price": 199, "mrp": 299},
+            "svc_cabinet":   {"name": "Kitchen Cabinet Clean",  "price": 199, "mrp": 299},
         },
     },
     "cat_packing": {
         "title": "Packing & shifting",
         "services": {
-            "svc_packing":   {"name": "Packing / Unpacking",    "price": 99},
+            "svc_packing":   {"name": "Packing / Unpacking",    "price": 199, "mrp": 299},
         },
     },
     "cat_party": {
         "title": "Party ready",
         "services": {
-            "svc_preparty":  {"name": "Pre-Party Express Clean",  "price": 99},
-            "svc_afterparty":{"name": "After-Party Express Clean","price": 99},
+            "svc_preparty":  {"name": "Pre-Party Express Clean",   "price": 199, "mrp": 299},
+            "svc_afterparty":{"name": "After-Party Express Clean", "short": "After-Party Clean", "price": 199, "mrp": 299},
         },
     },
     "cat_extras": {
         "title": "Extras",
         "services": {
-            "svc_window":    {"name": "Window Cleaning",        "price": 99},
-            "svc_fan":       {"name": "Fan Cleaning",           "price": 79},
-            "svc_dusting":   {"name": "Dusting & Wiping",       "price": 99},
-            "svc_balcony":   {"name": "Balcony Cleaning",       "price": 99},
-            "svc_fridge":    {"name": "Fridge Cleaning",        "price": 99},
-            "svc_plant":     {"name": "Plant Care",             "price": 99},
-            "svc_car":       {"name": "Car Surface Cleaning",   "price": 99},
+            "svc_window":    {"name": "Window Cleaning",        "price": 199},
+            "svc_fan":       {"name": "Fan Cleaning",           "price": 149, "mrp": 249},
+            "svc_dusting":   {"name": "Dusting & Wiping",       "price": 199, "mrp": 299},
+            "svc_balcony":   {"name": "Balcony Cleaning",       "price": 199, "mrp": 299},
+            "svc_fridge":    {"name": "Fridge Cleaning",        "price": 199, "mrp": 299},
+            "svc_plant":     {"name": "Plant Care",             "price": 199, "mrp": 299},
+            "svc_car":       {"name": "Car Surface Cleaning",   "price": 199, "mrp": 299},
         },
     },
 }
@@ -91,6 +102,36 @@ SLOTS = {
     "slot_afternoon": "Dopeher (12 PM - 3 PM)",
     "slot_evening":   "Shaam (3 PM - 6 PM)",
 }
+
+# ---------------- DIWALI OFFER WINDOW (Oct 2026) ----------------
+# Bookings for the Diwali offer are only accepted on these dates (India time).
+# Outside the window the Diwali menu/buttons disappear, and any old Diwali button
+# a customer taps gets a polite "offer ended" + the regular menu.
+# To extend the offer, just change DIWALI_LAST_DAY.
+IST = timezone(timedelta(hours=5, minutes=30))
+DIWALI_FIRST_DAY = date(2026, 10, 1)
+DIWALI_LAST_DAY = date(2026, 10, 31)
+DIWALI_SERVICES = set(CATALOG["cat_diwali"]["services"])
+
+def today_ist():
+    # Render's servers run on UTC; customers are in India, so "today" uses IST.
+    return datetime.now(IST).date()
+
+def diwali_active():
+    return DIWALI_FIRST_DAY <= today_ist() <= DIWALI_LAST_DAY
+
+# ---------------- PRICE DISPLAY ----------------
+def price_text(svc):
+    """For normal WhatsApp text messages: original price struck through, offer price bold."""
+    if svc.get("mrp"):
+        return f"~₹{svc['mrp']}~ *₹{svc['price']}*"
+    return f"*₹{svc['price']}*"
+
+def list_price(svc):
+    """WhatsApp list rows don't render ~strike~ formatting, so say it in plain words."""
+    if svc.get("mrp"):
+        return f"₹{svc['price']} (pehle ₹{svc['mrp']})"
+    return f"₹{svc['price']}"
 
 # ---------------- DATABASE (shared MongoDB with the web app) ----------------
 # The bot and the SevaSaathi web app use the SAME MongoDB, so WhatsApp orders
@@ -224,37 +265,87 @@ def send_buttons(to, body, buttons):
 
 # ---------------- BOT FLOW STEPS ----------------
 def show_welcome(phone):
-    send_buttons(phone,
-        f"Namaste! 🙏 {BUSINESS_NAME} mein aapka swagat hai.\n\n"
-        "Hum ghar ki cleaning services provide karte hain — verified professionals, "
-        "fixed pricing, aapke time pe.",
-        [{"id": "show_menu", "title": "Services dekhein"},
-         {"id": "join_worker", "title": "Kaam karna hai"}])
+    body = (f"Namaste! 🙏 {BUSINESS_NAME} mein aapka swagat hai.\n\n"
+            "Hum ghar ki cleaning services provide karte hain — verified professionals, "
+            "fixed pricing, aapke time pe.")
+    buttons = [{"id": "show_menu", "title": "Services dekhein"},
+               {"id": "join_worker", "title": "Kaam karna hai"}]
+    if diwali_active():   # DIWALI
+        body += ("\n\n🪔 *Diwali Special:* 1 house help ₹499 · 2 house help ₹799 "
+                 f"(booking {DIWALI_LAST_DAY.day} October tak)")
+        buttons.insert(0, {"id": "show_diwali", "title": "🪔 Diwali Offer"})
+    send_buttons(phone, body, buttons)
     update_session(phone, state="welcome_sent")
 
 def show_categories(phone):
     rows = [{"id": cid, "title": cat["title"][:24],
-             "description": ", ".join(s["name"] for s in cat["services"].values())[:72]}
-            for cid, cat in CATALOG.items()]
+             "description": cat.get("desc", ", ".join(s["name"] for s in cat["services"].values()))[:72]}
+            for cid, cat in CATALOG.items()
+            if cid != "cat_diwali" or diwali_active()]
     send_list(phone, "Kaunsi service chahiye?",
               "Category chuniye — agle step mein services aur pricing dikhegi.",
               "Category chunein", "Categories", rows)
     update_session(phone, state="choosing_category")
 
 def show_services(phone, cat_id):
+    if cat_id == "cat_diwali" and not diwali_active():
+        diwali_ended(phone); return
     cat = CATALOG[cat_id]
-    rows = [{"id": sid, "title": s["name"][:24], "description": f"₹{s['price']}"}
+    rows = [{"id": sid, "title": s.get("short", s["name"])[:24], "description": list_price(s)}
             for sid, s in cat["services"].items()]
     send_list(phone, cat["title"], "Service chuniye:", "Service chunein",
               cat["title"][:24], rows)
     update_session(phone, state="choosing_service", category=cat_id)
 
 def ask_address(phone, svc_id):
+    if svc_id in DIWALI_SERVICES and not diwali_active():
+        diwali_ended(phone); return
     svc = find_service(svc_id)
     send_text(phone,
-        f"✅ {svc['name']} — ₹{svc['price']}\n\n"
+        f"✅ {svc['name']} — {price_text(svc)}\n\n"
         "📍 Apna address bhejein (ghar number / mohalla + landmark):")
     update_session(phone, state="awaiting_address", service=svc_id)
+
+# ---------------- DIWALI FLOW (Oct 2026) — remove after the offer ----------------
+def show_diwali_options(phone):
+    if not diwali_active():
+        diwali_ended(phone); return
+    send_buttons(phone,
+        "🪔 *Diwali Cleaning Special*\n\n"
+        "Lakshmi Puja se pehle ghar chamkaayein! Kitne house help chahiye?\n\n"
+        "• 1 House Help — *₹499*\n"
+        "• 2 House Help — *₹799*\n\n"
+        f"📅 Booking sirf {DIWALI_LAST_DAY.day} October tak.",
+        [{"id": "svc_diwali_1", "title": "1 House Help ₹499"},
+         {"id": "svc_diwali_2", "title": "2 House Help ₹799"},
+         {"id": "show_menu", "title": "Baaki services"}])
+    update_session(phone, state="choosing_service", category="cat_diwali")
+
+def diwali_ended(phone):
+    send_text(phone,
+        "🪔 Diwali Cleaning offer ab available nahi hai (iski booking "
+        f"{DIWALI_FIRST_DAY.day}–{DIWALI_LAST_DAY.day} October tak hi thi). "
+        "Hamari baaki services neeche dekhein 👇")
+    show_categories(phone)
+
+DIWALI_WORDS = ("diwali", "deepawali", "deepavali", "dipawali", "दिवाली", "दीवाली", "दीपावली")
+
+def is_diwali_text(text_lower):
+    # "house help" is the Diwali offer's wording, so it counts only while the offer runs
+    return (any(w in text_lower for w in DIWALI_WORDS)
+            or (diwali_active() and "house help" in text_lower))
+
+def handle_diwali_text(phone, text_lower):
+    """The website's Diwali buttons send '... Diwali Cleaning — 1 house help (₹499).'
+    or '— 2 house help (₹799).' — anything else mentioning Diwali gets the options."""
+    if not diwali_active():
+        diwali_ended(phone)
+    elif "2 house help" in text_lower:
+        ask_address(phone, "svc_diwali_2")
+    elif "1 house help" in text_lower:
+        ask_address(phone, "svc_diwali_1")
+    else:
+        show_diwali_options(phone)
 
 def ask_date(phone):
     send_buttons(phone, "📅 Kis din service chahiye?",
@@ -274,6 +365,18 @@ def upi_link(price, order_id):
     return f"https://sevasaathi.co.in/pay.html?am={price}&o={order_id}"
 
 def confirm_order(phone, session):
+    # WhatsApp keeps old buttons tappable: tapping a time slot again after the
+    # booking is done (or before an address was given) must NOT create a blank
+    # "Unknown — ₹0" order and alert the admins.
+    if not (session.get("service") and session.get("address") and session.get("date")):
+        send_text(phone,
+            "Ye booking pehle hi confirm ho chuki hai ya adhoori reh gayi thi 🙏\n"
+            "Nayi booking ke liye 'menu' likhein.")
+        return
+    # DIWALI: the offer closed while this customer was still mid-booking
+    if session["service"] in DIWALI_SERVICES and not diwali_active():
+        reset_session(phone)
+        diwali_ended(phone); return
     svc = find_service(session["service"])
     order_date = session["date"]
     slot_label = SLOTS.get(session["slot"], session["slot"])
@@ -298,7 +401,7 @@ def confirm_order(phone, session):
         f"Service: {svc['name']}\n"
         f"Date: {order_date}\nTime: {slot_label}\n"
         f"Address: {session['address']}\n"
-        f"Amount: ₹{svc['price']}\n"
+        f"Amount: {price_text(svc)}\n"
         f"Payment: {pay_label}\n\n"
         "Hamara professional jaldi confirm karega. Koi sawal ho to yahi reply karein. "
         "Nayi booking ke liye 'menu' likhein.")
@@ -413,7 +516,7 @@ def handle_message(phone, text, interactive_id):
         return
 
     # website pre-filled messages, e.g. "Hi SevaSaathi, I'd like to book
-    # Bathroom Deep Clean (₹299)." — detect the service name and jump
+    # Bathroom Deep Clean (₹199)." — detect the service name and jump
     # straight to the address step (but never while the customer is mid-flow
     # typing an address/date, or filling the worker form — those answers can
     # contain service words like "bathroom")
@@ -424,6 +527,12 @@ def handle_message(phone, text, interactive_id):
                 if s["name"].lower() in text_lower:
                     ask_address(phone, sid)
                     return
+        # DIWALI: the website's Diwali cards ("... Diwali Cleaning — 2 house
+        # help (₹799).") or anyone typing about Diwali. Checked after the
+        # service names, so "diwali se pehle bathroom deep clean" -> bathroom.
+        if is_diwali_text(text_lower):
+            handle_diwali_text(phone, text_lower)
+            return
         # generic booking intent from the website without a specific service
         if "sevasaathi" in text_lower or "book" in text_lower:
             show_categories(phone)
@@ -433,18 +542,19 @@ def handle_message(phone, text, interactive_id):
     if interactive_id:
         if interactive_id == "show_menu":
             show_categories(phone); return
+        if interactive_id == "show_diwali":   # DIWALI
+            show_diwali_options(phone); return
         if interactive_id == "join_worker":
             start_worker_signup(phone); return
         if interactive_id in CATALOG:
             show_services(phone, interactive_id); return
         if find_service(interactive_id)["price"] > 0 or interactive_id.startswith("svc_"):
             ask_address(phone, interactive_id); return
-        if interactive_id == "date_today":
-            update_session(phone, date=datetime.now().strftime("%d-%m-%Y"))
+        if interactive_id == "date_today":   # India date, not the server's UTC date
+            update_session(phone, date=today_ist().strftime("%d-%m-%Y"))
             ask_slot(phone); return
         if interactive_id == "date_tomorrow":
-            from datetime import timedelta
-            update_session(phone, date=(datetime.now() + timedelta(days=1)).strftime("%d-%m-%Y"))
+            update_session(phone, date=(today_ist() + timedelta(days=1)).strftime("%d-%m-%Y"))
             ask_slot(phone); return
         if interactive_id == "date_other":
             send_text(phone, "📅 Date likhein (jaise: 15-07-2026):")
