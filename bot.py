@@ -6,6 +6,7 @@ Flow: Welcome -> Category menu -> Service menu -> Address -> Date -> Slot -> Con
 """
 
 import os
+import sys
 import json
 import requests
 from datetime import datetime, date, timedelta, timezone
@@ -15,6 +16,14 @@ from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 app = Flask(__name__)
+
+# On Render, print() output sits in Python's 8 KB buffer and only reaches the
+# Logs tab once the buffer fills up — so error messages could stay invisible for
+# days. Flush after every line so problems show up in Logs immediately.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 # ---------------- CONFIG (set these as environment variables) ----------------
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "my_secret_verify_token_123")
@@ -226,8 +235,12 @@ def send(payload):
     payload["messaging_product"] = "whatsapp"
     r = requests.post(API_URL, headers=HEADERS, json=payload, timeout=15)
     if r.status_code != 200:
-        print("SEND ERROR:", r.status_code, r.text)
+        print("SEND ERROR to", mask(payload.get("to")), ":", r.status_code, r.text)
     return r
+
+def mask(phone):
+    """Only the last 4 digits in the logs — enough to tell customers apart."""
+    return f"...{str(phone)[-4:]}" if phone else "?"
 
 def send_text(to, text):
     send({"to": to, "type": "text", "text": {"body": text}})
@@ -621,11 +634,19 @@ def webhook():
         for entry in data.get("entry", []):
             for change in entry.get("changes", []):
                 value = change.get("value", {})
+                # Meta tells us only LATER (as a "failed" status) when one of our
+                # replies couldn't be delivered — e.g. account, payment or policy
+                # problems. Log it, otherwise the bot just looks silent.
+                for st in value.get("statuses", []):
+                    if st.get("status") == "failed":
+                        print("DELIVERY FAILED to", mask(st.get("recipient_id")), ":",
+                              json.dumps(st.get("errors"), ensure_ascii=False))
                 for msg in value.get("messages", []):
                     # Skip duplicate/retried webhook deliveries of the same message.
                     if already_processed(msg.get("id")):
                         continue
                     phone = msg["from"]
+                    print("MESSAGE IN from", mask(phone), "-", msg.get("type"))
                     text, interactive_id = None, None
                     if msg["type"] == "text":
                         text = msg["text"]["body"]
