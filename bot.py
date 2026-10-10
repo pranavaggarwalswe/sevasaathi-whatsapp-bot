@@ -57,50 +57,50 @@ CATALOG = {
     "cat_cleaning": {
         "title": "Cleaning services",
         "services": {
-            "svc_mopping":   {"name": "Floor Sweeping & Mopping", "price": 199},
-            "svc_bathroom":  {"name": "Bathroom Deep Clean",      "price": 199, "mrp": 299},
-            "svc_kitchen":   {"name": "Kitchen Cleaning",         "price": 199, "mrp": 349},
+            "svc_mopping":   {"name": "Floor Sweeping & Mopping", "price": 149, "mrp": 199},
+            "svc_bathroom":  {"name": "Bathroom Deep Clean",      "price": 149, "mrp": 299},
+            "svc_kitchen":   {"name": "Kitchen Cleaning",         "price": 149, "mrp": 349},
             "svc_deepclean": {"name": "Full House Deep Clean",    "price": 499, "mrp": 999},
-            "svc_sofa":      {"name": "Carpet & Sofa Cleaning",   "price": 199, "mrp": 499},
+            "svc_sofa":      {"name": "Carpet & Sofa Cleaning",   "price": 149, "mrp": 499},
         },
     },
     "cat_laundry": {
         "title": "Laundry & wardrobe",
         "services": {
-            "svc_laundry":   {"name": "Laundry & Ironing",      "price": 199, "mrp": 249},
-            "svc_wardrobe":  {"name": "Wardrobe Cleaning",      "price": 199, "mrp": 299},
+            "svc_laundry":   {"name": "Laundry & Ironing",      "price": 149, "mrp": 249},
+            "svc_wardrobe":  {"name": "Wardrobe Cleaning",      "price": 149, "mrp": 299},
         },
     },
     "cat_kitchen": {
         "title": "Kitchen & utensils",
         "services": {
-            "svc_utensils":  {"name": "Utensil Washing",        "price": 199, "mrp": 249},
-            "svc_kprep":     {"name": "Kitchen Prep",           "price": 199, "mrp": 299},
-            "svc_cabinet":   {"name": "Kitchen Cabinet Clean",  "price": 199, "mrp": 299},
+            "svc_utensils":  {"name": "Utensil Washing",        "price": 149, "mrp": 249},
+            "svc_kprep":     {"name": "Kitchen Prep",           "price": 149, "mrp": 299},
+            "svc_cabinet":   {"name": "Kitchen Cabinet Clean",  "price": 149, "mrp": 299},
         },
     },
     "cat_packing": {
         "title": "Packing & shifting",
         "services": {
-            "svc_packing":   {"name": "Packing / Unpacking",    "price": 199, "mrp": 299},
+            "svc_packing":   {"name": "Packing / Unpacking",    "price": 149, "mrp": 299},
         },
     },
     "cat_party": {
         "title": "Party ready",
         "services": {
-            "svc_preparty":  {"name": "Pre-Party Express Clean",   "price": 199, "mrp": 299},
-            "svc_afterparty":{"name": "After-Party Express Clean", "short": "After-Party Clean", "price": 199, "mrp": 299},
+            "svc_preparty":  {"name": "Pre-Party Express Clean",   "price": 399},
+            "svc_afterparty":{"name": "After-Party Express Clean", "short": "After-Party Clean", "price": 399},
         },
     },
     "cat_extras": {
         "title": "Extras",
         "services": {
-            "svc_window":    {"name": "Window Cleaning",        "price": 199},
-            "svc_fan":       {"name": "Fan Cleaning",           "price": 149, "mrp": 249},
-            "svc_dusting":   {"name": "Dusting & Wiping",       "price": 199, "mrp": 299},
-            "svc_balcony":   {"name": "Balcony Cleaning",       "price": 199, "mrp": 299},
-            "svc_fridge":    {"name": "Fridge Cleaning",        "price": 199, "mrp": 299},
-            "svc_car":       {"name": "Car Surface Cleaning",   "price": 199, "mrp": 299},
+            "svc_window":    {"name": "Window Cleaning",        "price": 149, "mrp": 199},
+            "svc_fan":       {"name": "Fan Cleaning",           "price": 99, "mrp": 249},
+            "svc_dusting":   {"name": "Dusting & Wiping",       "price": 149, "mrp": 299},
+            "svc_balcony":   {"name": "Balcony Cleaning",       "price": 149, "mrp": 299},
+            "svc_fridge":    {"name": "Fridge Cleaning",        "price": 149, "mrp": 299},
+            "svc_car":       {"name": "Car Surface Cleaning",   "price": 149, "mrp": 299},
         },
     },
 }
@@ -141,7 +141,7 @@ def strike(text):
     return "".join(ch + "̶" for ch in text)
 
 def list_price(svc):
-    """For WhatsApp list rows: struck original + offer price, e.g. ₹̶2̶9̶9̶ ₹199"""
+    """For WhatsApp list rows: struck original + offer price, e.g. ₹̶2̶9̶9̶ ₹149"""
     if svc.get("mrp"):
         return f"{strike('₹' + str(svc['mrp']))} ₹{svc['price']}"
     return f"₹{svc['price']}"
@@ -543,7 +543,7 @@ def handle_message(phone, text, interactive_id):
         return
 
     # website pre-filled messages, e.g. "Hi SevaSaathi, I'd like to book
-    # Bathroom Deep Clean (₹199)." — detect the service name and jump
+    # Bathroom Deep Clean (₹149)." — detect the service name and jump
     # straight to the address step (but never while the customer is mid-flow
     # typing an address/date, or filling the worker form — those answers can
     # contain service words like "bathroom")
